@@ -12,6 +12,12 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # no-op si no existe .env (p.ej. en Streamlit Cloud, que usa Secrets)
+except ImportError:
+    pass
+
 import config
 import database as db
 from data_providers import get_provider
@@ -25,19 +31,28 @@ db.init_db()
 # Sidebar: configuración global
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Configuración")
+PROVIDERS = ["demo", "yfinance", "fmp", "polygon"]
 provider_name = st.sidebar.selectbox(
     "Proveedor de datos",
-    options=["demo", "fmp", "polygon"],
-    index=["demo", "fmp", "polygon"].index(config.DEFAULT_PROVIDER)
-    if config.DEFAULT_PROVIDER in ["demo", "fmp", "polygon"] else 0,
+    options=PROVIDERS,
+    index=PROVIDERS.index(config.DEFAULT_PROVIDER) if config.DEFAULT_PROVIDER in PROVIDERS else 0,
     help="'demo' genera datos sintéticos y no requiere API key. "
-         "'fmp' y 'polygon' requieren definir las claves de API en el entorno (.env)."
+         "'yfinance' (Yahoo Finance) es gratuito y no requiere API key, pero "
+         "sus fundamentales son menos completos/fiables que un proveedor de "
+         "pago. 'fmp' y 'polygon' requieren definir las claves de API en el "
+         "entorno (.env o Secrets de Streamlit Cloud)."
 )
 
-if provider_name != "demo":
+if provider_name in ("fmp", "polygon"):
     st.sidebar.warning(
         "Este proveedor requiere una API key válida en el entorno "
         f"({'FMP_API_KEY' if provider_name == 'fmp' else 'POLYGON_API_KEY'})."
+    )
+elif provider_name == "yfinance":
+    st.sidebar.info(
+        "Yahoo Finance no requiere API key, pero los múltiplos 'justos' de "
+        "sector son una aproximación estática (no hay benchmark de peers "
+        "real) y algunos campos fundamentales pueden faltar según el ticker."
     )
 
 try:
@@ -105,6 +120,19 @@ def render_price_chart(price_df):
         fig_cmf.update_layout(height=280, title="Chaikin Money Flow")
         st.plotly_chart(fig_cmf, use_container_width=True)
 
+    if "bbw" in price_df.columns:
+        fig_bbw = go.Figure()
+        fig_bbw.add_trace(go.Scatter(x=price_df["date"], y=price_df["bbw"], name="BBW"))
+        if "vcp_signal" in price_df.columns:
+            vcp_points = price_df[price_df["vcp_signal"] == True]  # noqa: E712
+            if not vcp_points.empty:
+                fig_bbw.add_trace(go.Scatter(
+                    x=vcp_points["date"], y=vcp_points["bbw"], mode="markers",
+                    marker=dict(color="red", size=6), name="VCP detectado"
+                ))
+        fig_bbw.update_layout(height=280, title="Bollinger Band Width (squeeze de volatilidad)")
+        st.plotly_chart(fig_bbw, use_container_width=True)
+
 
 def render_score_detail(score: dict, conditions: dict):
     st.metric(
@@ -117,12 +145,14 @@ def render_score_detail(score: dict, conditions: dict):
     labels = {
         "margen_seguridad": f"Margen de Seguridad (mín. exigido {conditions.get('_margen_minimo_exigido_pct', 0):.0f}%)",
         "piotroski": f"Piotroski F-Score (≥{config.PIOTROSKI_MIN_SCORE}/9)",
+        "vcp_detectado": "VCP — Patrón de Contracción de Volatilidad",
         "dilucion_controlada": "Control de Dilución (≤3% YoY)",
         "pullback_tendencia": "Pullback en Tendencia (>MM200 y <MM50)",
         "rsi_bajo": f"RSI(14) < {config.RSI_MAX}",
         "acumulacion_institucional": "Acumulación Institucional (CMF>0 u OBV MM20 ↑)",
         "peg_atractivo": "PEG < PEG medio sector",
         "alejado_maximos": "Precio ≤ 90% del máx. 52 semanas",
+        "insider_buying": "Insider Buying (compras netas de directivos)",
         "consenso_analistas": "Precio < Precio objetivo analistas",
     }
     for key, info in detail.items():
@@ -225,6 +255,11 @@ else:
             badges.append(f"🏆 Regla del 40 ({v.get('rule_of_40_score', 0):.0f}%)")
         if meta.get("is_financial"):
             badges.append("🏦 Financiera (incluye Price/Book)")
+        if result["technical_snapshot"].get("vcp_signal"):
+            badges.append("🌀 VCP detectado (squeeze de volatilidad)")
+        insider = result.get("insider_activity", {})
+        if insider.get("signal"):
+            badges.append(f"💼 Insider Buying (compras netas ${insider.get('net_value', 0):,.0f})")
         if badges:
             st.write(" · ".join(badges))
 
@@ -240,6 +275,8 @@ else:
 
         with st.expander("Ver datos fundamentales crudos (payload del proveedor)"):
             st.json(result["fundamentals_raw"])
+        with st.expander("Ver actividad de insiders (compras/ventas de directivos)"):
+            st.json(result["insider_activity"])
         with st.expander("Ver benchmark sectorial usado"):
             st.json(result["sector_benchmark"])
         with st.expander("Ver contexto macro (US10Y, régimen S&P 500)"):

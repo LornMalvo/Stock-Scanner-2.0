@@ -51,18 +51,20 @@ RULE_OF_40_THRESHOLD = 0.40
 SCORING_WEIGHTS = {
     "margen_seguridad": 3,
     "piotroski": 3,
+    "vcp_detectado": 3,
     "dilucion_controlada": 2,
     "pullback_tendencia": 2,
     "rsi_bajo": 2,
     "acumulacion_institucional": 2,
     "peg_atractivo": 2,
     "alejado_maximos": 2,
+    "insider_buying": 2,
     "consenso_analistas": 1,
 }
-TOTAL_WEIGHT = sum(SCORING_WEIGHTS.values())  # 19
+TOTAL_WEIGHT = sum(SCORING_WEIGHTS.values())  # 24
 
 # % del peso total que debe alcanzarse para considerar "SEÑAL DE ENTRADA"
-SIGNAL_SCORE_THRESHOLD_PCT = 0.65  # >=65% de 19 => >= 12.35 puntos
+SIGNAL_SCORE_THRESHOLD_PCT = 0.65  # >=65% del TOTAL_WEIGHT vigente
 
 # Margen de seguridad mínimo exigido (peso 3). Sube en régimen bajista de mercado.
 MARGIN_OF_SAFETY_MIN_BULL = 0.10
@@ -84,3 +86,34 @@ PCT_OF_52W_HIGH_MAX = 0.90
 # Universo de análisis
 # ---------------------------------------------------------------------------
 BENCHMARK_TICKER = "^GSPC"  # S&P 500 para el filtro macro de régimen de mercado
+
+# ---------------------------------------------------------------------------
+# VCP — Volatility Contraction Pattern (Bollinger Band Width + Volumen)
+# ---------------------------------------------------------------------------
+# BBW = (Banda_Superior - Banda_Inferior) / Media_Móvil_20  (Bollinger 20, 2 sigma)
+VCP_BB_LENGTH = 20
+VCP_BB_STD = 2.0
+# Ventana histórica (sesiones) sobre la que se mide si la BBW actual está en
+# un mínimo relativo ("el mercado se seca de vendedores").
+VCP_BBW_LOOKBACK = 126  # ~6 meses bursátiles
+# La BBW actual debe estar por debajo de este percentil de su propia
+# distribución en la ventana anterior para considerarse "squeeze".
+VCP_BBW_PERCENTILE = 0.20  # <= percentil 20
+# Confirmación por volumen: la media de volumen reciente debe haberse
+# contraído frente a la media de volumen de un periodo más largo.
+VCP_VOLUME_SHORT = 10
+VCP_VOLUME_LONG = 50
+VCP_VOLUME_CONTRACTION_RATIO = 0.80  # vol_media_10 <= 0.80 * vol_media_50
+
+# ---------------------------------------------------------------------------
+# Insider Buying — flujo neto de transacciones de directivos (FMP)
+# ---------------------------------------------------------------------------
+INSIDER_CACHE_TTL_DAYS = 3
+INSIDER_LOOKBACK_DAYS = 90  # "último trimestre"
+# Señal activa si el valor comprado por insiders supera este múltiplo del
+# valor vendido (si no hubo ventas y sí compras, también se activa).
+INSIDER_BUY_SELL_RATIO_MIN = 2.0
+# Filtro mínimo de compras para evitar que una única compra pequeña dispare
+# la señal (ruido). Umbral en USD.
+INSIDER_MIN_BUY_VALUE_USD = 50_000
+

@@ -4,3 +4,5 @@ numpy>=1.26
 plotly>=5.22
 requests>=2.31
 python-dotenv>=1.0
+yfinance>=0.2.40
+lxml>=5.2

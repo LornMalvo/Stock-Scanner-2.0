@@ -79,6 +79,13 @@ def init_db():
             payload TEXT,
             updated_at TEXT
         )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS insider_activity (
+            ticker TEXT PRIMARY KEY,
+            payload TEXT,       -- JSON: buy_value, sell_value, buy_count, sell_count, net_value, signal
+            updated_at TEXT
+        )""")
         c.execute("""
         CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date)
         """)
@@ -244,4 +251,29 @@ def load_macro(key):
         return None, True
     payload = json.loads(row[0])
     stale = _is_stale(row[1], timedelta(hours=config.MACRO_CACHE_TTL_HOURS))
+    return payload, stale
+
+
+# ---------------------------------------------------------------------------
+# Actividad de insiders (compras/ventas de directivos)
+# ---------------------------------------------------------------------------
+def save_insider_activity(ticker, payload: dict):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO insider_activity (ticker, payload, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                payload=excluded.payload, updated_at=excluded.updated_at
+        """, (ticker, json.dumps(payload), datetime.utcnow().isoformat()))
+
+
+def load_insider_activity(ticker):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT payload, updated_at FROM insider_activity WHERE ticker=?", (ticker,)
+        ).fetchone()
+    if not row:
+        return None, True
+    payload = json.loads(row[0])
+    stale = _is_stale(row[1], timedelta(days=config.INSIDER_CACHE_TTL_DAYS))
     return payload, stale
