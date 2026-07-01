@@ -14,6 +14,16 @@ class DataProvider(ABC):
 
     name = "base"
 
+    # Pausa (segundos) que engines.scanner debe respetar entre tickers en un
+    # escaneo masivo. 0 por defecto; los proveedores propensos a
+    # rate-limiting (ej. yfinance) lo suben en su __init__.
+    request_delay_seconds = 0
+
+    # Se actualiza tras cada llamada a get_sp500_universe(): 'wikipedia',
+    # 'fallback', 'native', 'cache:...', etc. engines.scanner lo usa para
+    # avisar en la UI si el universo obtenido está degradado.
+    last_universe_source = "native"
+
     @abstractmethod
     def get_sp500_universe(self) -> list:
         """Devuelve lista de dicts: [{ticker, name, sector, industry, is_financial}, ...]"""
@@ -24,6 +34,18 @@ class DataProvider(ABC):
         """Devuelve DataFrame con columnas: date, open, high, low, close_adj, volume.
         close_adj DEBE estar ajustado por splits y dividendos."""
         raise NotImplementedError
+
+    def get_price_history_bulk(self, tickers: list, lookback_days: int = 400) -> dict:
+        """
+        Versión "por lotes" de get_price_history(), pensada para reducir el
+        número de peticiones HTTP en un escaneo masivo (relevante sobre todo
+        para proveedores con rate-limiting agresivo, como yfinance).
+
+        NO es abstracto: la implementación por defecto simplemente llama a
+        get_price_history() en un bucle, así que cualquier proveedor
+        funciona sin cambios aunque no sobrescriba este método.
+        """
+        return {t: self.get_price_history(t, lookback_days) for t in tickers}
 
     @abstractmethod
     def get_fundamentals(self, ticker: str) -> dict:

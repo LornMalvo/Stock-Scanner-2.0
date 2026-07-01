@@ -18,16 +18,46 @@ necesidad de API key. Útil para arrancar sin credenciales y con datos reales
 """
 
 from datetime import datetime, timedelta
+from io import StringIO
+import time
 
 import numpy as np
 import pandas as pd
+import requests
 
 from .base import DataProvider
+import config
 
 try:
     import yfinance as yf
 except ImportError:  # pragma: no cover
     yf = None
+
+# Wikipedia (y Yahoo) rechazan peticiones sin cabecera de navegador con un
+# 403/errores de parseo intermitentes. Con esta cabecera se scrapea de forma
+# mucho más fiable.
+_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+
+def _retry(fn, retries=None, backoff=None, label=""):
+    """Ejecuta fn() con reintentos y backoff exponencial. Pensado para las
+    llamadas más propensas a rate-limiting de Yahoo (429 / 'Too Many
+    Requests'). Si todos los intentos fallan, relanza la última excepción."""
+    retries = config.YF_MAX_RETRIES if retries is None else retries
+    backoff = config.YF_BACKOFF_BASE_SECONDS if backoff is None else backoff
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as exc:  # yfinance lanza distintos tipos según versión
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+    raise last_exc
 
 
 # Múltiplos "justos" de sector por defecto — aproximación razonable cuando
@@ -46,6 +76,44 @@ _SECTOR_DEFAULTS = {
     "Communication Services": {"per_justo": 20, "peg_justo": 1.6, "ev_ebitda_justo": 10, "pb_justo": 3.0, "ev_sales_justo": 3.0},
 }
 _DEFAULT_BENCHMARK = {"per_justo": 20.0, "peg_justo": 1.6, "ev_ebitda_justo": 12.0, "pb_justo": 3.0, "ev_sales_justo": 3.0}
+
+# Fallback SOLO para cuando el scraping de Wikipedia falla por completo (sin
+# red, bloqueo, cambio de estructura de la página...). NO pretende ser el
+# S&P 500 completo — es un conjunto diversificado de ~50 blue chips que
+# cubre las 11 categorías GICS, para que un escaneo degradado siga siendo
+# mínimamente representativo en vez de limitarse a un puñado de tickers.
+# Se marca explícitamente como 'fallback' (ver last_universe_source) para
+# que la UI avise de que no es el universo completo.
+_FALLBACK_UNIVERSE = [
+    ("AAPL", "Apple Inc.", "Technology"), ("MSFT", "Microsoft Corp.", "Technology"),
+    ("NVDA", "NVIDIA Corp.", "Technology"), ("AVGO", "Broadcom Inc.", "Technology"),
+    ("ORCL", "Oracle Corp.", "Technology"), ("CRM", "Salesforce Inc.", "Technology"),
+    ("AMZN", "Amazon.com Inc.", "Consumer Cyclical"), ("TSLA", "Tesla Inc.", "Consumer Cyclical"),
+    ("HD", "Home Depot Inc.", "Consumer Cyclical"), ("MCD", "McDonald's Corp.", "Consumer Cyclical"),
+    ("NKE", "Nike Inc.", "Consumer Cyclical"), ("LOW", "Lowe's Companies Inc.", "Consumer Cyclical"),
+    ("GOOGL", "Alphabet Inc.", "Communication Services"), ("META", "Meta Platforms Inc.", "Communication Services"),
+    ("NFLX", "Netflix Inc.", "Communication Services"), ("DIS", "Walt Disney Co.", "Communication Services"),
+    ("JPM", "JPMorgan Chase & Co.", "Financial Services"), ("BAC", "Bank of America Corp.", "Financial Services"),
+    ("WFC", "Wells Fargo & Co.", "Financial Services"), ("GS", "Goldman Sachs Group Inc.", "Financial Services"),
+    ("V", "Visa Inc.", "Financial Services"), ("MA", "Mastercard Inc.", "Financial Services"),
+    ("JNJ", "Johnson & Johnson", "Healthcare"), ("UNH", "UnitedHealth Group Inc.", "Healthcare"),
+    ("PFE", "Pfizer Inc.", "Healthcare"), ("LLY", "Eli Lilly and Co.", "Healthcare"),
+    ("ABBV", "AbbVie Inc.", "Healthcare"), ("MRK", "Merck & Co. Inc.", "Healthcare"),
+    ("XOM", "Exxon Mobil Corp.", "Energy"), ("CVX", "Chevron Corp.", "Energy"),
+    ("COP", "ConocoPhillips", "Energy"),
+    ("PG", "Procter & Gamble Co.", "Consumer Defensive"), ("KO", "Coca-Cola Co.", "Consumer Defensive"),
+    ("PEP", "PepsiCo Inc.", "Consumer Defensive"), ("WMT", "Walmart Inc.", "Consumer Defensive"),
+    ("COST", "Costco Wholesale Corp.", "Consumer Defensive"),
+    ("GE", "General Electric Co.", "Industrials"), ("CAT", "Caterpillar Inc.", "Industrials"),
+    ("BA", "Boeing Co.", "Industrials"), ("UPS", "United Parcel Service Inc.", "Industrials"),
+    ("HON", "Honeywell International Inc.", "Industrials"),
+    ("NEE", "NextEra Energy Inc.", "Utilities"), ("DUK", "Duke Energy Corp.", "Utilities"),
+    ("SO", "Southern Co.", "Utilities"),
+    ("LIN", "Linde plc", "Basic Materials"), ("APD", "Air Products and Chemicals Inc.", "Basic Materials"),
+    ("FCX", "Freeport-McMoRan Inc.", "Basic Materials"),
+    ("PLD", "Prologis Inc.", "Real Estate"), ("AMT", "American Tower Corp.", "Real Estate"),
+    ("EQIX", "Equinix Inc.", "Real Estate"),
+]
 
 
 def _num(value):
@@ -76,6 +144,7 @@ def _row(df: pd.DataFrame, candidates, col_idx=0):
 
 class YFinanceProvider(DataProvider):
     name = "yfinance"
+    request_delay_seconds = config.YF_REQUEST_DELAY_SECONDS
 
     def __init__(self):
         if yf is None:
@@ -83,15 +152,28 @@ class YFinanceProvider(DataProvider):
                 "Falta la librería 'yfinance'. Añádela a requirements.txt e "
                 "instala con `pip install yfinance`."
             )
+        self.last_universe_source = "native"
 
     # -- universo -------------------------------------------------------------
     def get_sp500_universe(self) -> list:
-        """Lee la composición actual del S&P 500 desde Wikipedia (no requiere
-        API key). Si falla la conexión, devuelve una lista reducida de
-        fallback para que la app siga siendo usable."""
+        """
+        Lee la composición actual del S&P 500 desde Wikipedia (no requiere
+        API key). Usa cabeceras de navegador porque tanto Wikipedia como
+        algunos proxies rechazan peticiones sin User-Agent.
+
+        Si falla (sin red, bloqueo, cambio de estructura de la página...),
+        cae a `_FALLBACK_UNIVERSE` (un subconjunto diversificado, NO el
+        S&P 500 completo) y lo marca en `self.last_universe_source =
+        'fallback'` para que engines/scanner.py pueda avisar en la UI.
+        """
         financial_sectors = {"Financial Services", "Financials"}
         try:
-            tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+            resp = requests.get(
+                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                headers=_BROWSER_HEADERS, timeout=15
+            )
+            resp.raise_for_status()
+            tables = pd.read_html(StringIO(resp.text))
             table = tables[0]
             out = []
             for _, row in table.iterrows():
@@ -103,21 +185,63 @@ class YFinanceProvider(DataProvider):
                     "industry": str(row.get("GICS Sub-Industry", sector)),
                     "is_financial": sector in financial_sectors,
                 })
-            return [o for o in out if o["ticker"]]
+            out = [o for o in out if o["ticker"]]
+            if len(out) < 400:  # sanity check: si la tabla vino incompleta, no la demos por buena
+                raise ValueError(f"Tabla de Wikipedia con solo {len(out)} filas (esperadas ~500)")
+            self.last_universe_source = "wikipedia"
+            return out
         except Exception:
-            # Fallback mínimo si no hay red o Wikipedia cambia de estructura
-            fallback = [
-                ("AAPL", "Apple Inc.", "Technology"), ("MSFT", "Microsoft Corp.", "Technology"),
-                ("AMZN", "Amazon.com Inc.", "Consumer Cyclical"), ("GOOGL", "Alphabet Inc.", "Communication Services"),
-                ("JPM", "JPMorgan Chase & Co.", "Financial Services"), ("JNJ", "Johnson & Johnson", "Healthcare"),
-                ("XOM", "Exxon Mobil Corp.", "Energy"), ("PG", "Procter & Gamble Co.", "Consumer Defensive"),
-            ]
+            self.last_universe_source = "fallback"
             return [{
                 "ticker": t, "name": n, "sector": s, "industry": s,
                 "is_financial": s in financial_sectors,
-            } for t, n, s in fallback]
+            } for t, n, s in _FALLBACK_UNIVERSE]
 
     # -- precios --------------------------------------------------------------
+    def get_price_history_bulk(self, tickers: list, lookback_days: int = 400) -> dict:
+        """
+        Descarga en un único lote (o pocos lotes) el histórico de todos los
+        tickers, en vez de hacer una petición yf.Ticker(t).history() por
+        ticker. Reduce drásticamente el número de peticiones HTTP en un
+        escaneo masivo, que es la principal causa de rate-limiting (429) de
+        Yahoo en IPs compartidas como Streamlit Community Cloud.
+        """
+        if not tickers:
+            return {}
+        start = (datetime.utcnow() - timedelta(days=lookback_days)).date().isoformat()
+        out = {}
+
+        # yf.download también puede ser rate-limitado con universos grandes;
+        # se trocea en lotes moderados + reintentos por lote.
+        batch_size = 60
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i + batch_size]
+            try:
+                data = _retry(lambda: yf.download(
+                    tickers=batch, start=start, auto_adjust=True,
+                    group_by="ticker", threads=True, progress=False
+                ))
+            except Exception:
+                data = pd.DataFrame()
+
+            for t in batch:
+                try:
+                    sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                    sub = sub.dropna(how="all").reset_index()
+                    sub = sub.rename(columns={
+                        "Date": "date", "Open": "open", "High": "high",
+                        "Low": "low", "Close": "close_adj", "Volume": "volume",
+                    })
+                    sub["date"] = pd.to_datetime(sub["date"]).dt.tz_localize(None)
+                    out[t] = sub[["date", "open", "high", "low", "close_adj", "volume"]].dropna(subset=["close_adj"])
+                except Exception:
+                    out[t] = pd.DataFrame(columns=["date", "open", "high", "low", "close_adj", "volume"])
+
+            if i + batch_size < len(tickers):
+                time.sleep(config.YF_REQUEST_DELAY_SECONDS)
+
+        return out
+
     def get_price_history(self, ticker: str, lookback_days: int = 400):
         t = yf.Ticker(ticker)
         start = (datetime.utcnow() - timedelta(days=lookback_days)).date()
@@ -137,7 +261,7 @@ class YFinanceProvider(DataProvider):
     def get_fundamentals(self, ticker: str) -> dict:
         t = yf.Ticker(ticker)
         try:
-            info = t.info or {}
+            info = _retry(lambda: t.info) or {}
         except Exception:
             info = {}
 
@@ -176,9 +300,9 @@ class YFinanceProvider(DataProvider):
         shares_now = _num(info.get("sharesOutstanding"))
         shares_prior = None
         try:
-            shares_hist = t.get_shares_full(
+            shares_hist = _retry(lambda: t.get_shares_full(
                 start=(datetime.utcnow() - timedelta(days=420)).date().isoformat()
-            )
+            ))
             if shares_hist is not None and not shares_hist.empty:
                 shares_prior = _num(shares_hist.iloc[0])
         except Exception:
@@ -249,12 +373,11 @@ class YFinanceProvider(DataProvider):
 
     # -- insider trading ---------------------------------------------------------
     def get_insider_activity(self, ticker: str) -> dict:
-        import config as _cfg
-        cutoff = datetime.utcnow() - timedelta(days=_cfg.INSIDER_LOOKBACK_DAYS)
+        cutoff = datetime.utcnow() - timedelta(days=config.INSIDER_LOOKBACK_DAYS)
 
         try:
             t = yf.Ticker(ticker)
-            tx = t.insider_transactions
+            tx = _retry(lambda: t.insider_transactions)
         except Exception:
             tx = None
 
@@ -280,8 +403,8 @@ class YFinanceProvider(DataProvider):
 
         net_value = buy_value - sell_value
         signal = (
-            buy_value >= _cfg.INSIDER_MIN_BUY_VALUE_USD
-            and (sell_value == 0 or buy_value >= sell_value * _cfg.INSIDER_BUY_SELL_RATIO_MIN)
+            buy_value >= config.INSIDER_MIN_BUY_VALUE_USD
+            and (sell_value == 0 or buy_value >= sell_value * config.INSIDER_BUY_SELL_RATIO_MIN)
         )
         return {
             "buy_value": buy_value, "sell_value": sell_value,
