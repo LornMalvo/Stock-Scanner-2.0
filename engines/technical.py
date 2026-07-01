@@ -61,6 +61,42 @@ def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     return (direction * volume).cumsum()
 
 
+def _bollinger_bandwidth(close: pd.Series, length: int = 20, std_mult: float = 2.0):
+    """Bandas de Bollinger estándar y su anchura normalizada (BBW).
+
+    BBW = (Banda_Superior - Banda_Inferior) / Media_Móvil_20
+    """
+    ma = close.rolling(length).mean()
+    std = close.rolling(length).std()
+    upper = ma + std_mult * std
+    lower = ma - std_mult * std
+    bbw = (upper - lower) / ma.replace(0, np.nan)
+    return ma, upper, lower, bbw
+
+
+def _detect_vcp(df: pd.DataFrame) -> pd.Series:
+    """
+    Patrón de Contracción de Volatilidad (VCP): el mercado "se seca" de
+    vendedores. Señal = TRUE cuando se cumplen a la vez:
+      1) Squeeze de volatilidad: la BBW actual está en un mínimo relativo
+         (percentil bajo) respecto a su propia distribución reciente.
+      2) Confirmación por volumen: el volumen medio reciente se ha
+         contraído frente a un periodo más largo (compradores/vendedores
+         "agotados", sin presión vendedora activa).
+    Todo vectorizado con pandas rolling — sin bucles fila a fila.
+    """
+    bbw_threshold = df["bbw"].rolling(
+        config.VCP_BBW_LOOKBACK, min_periods=30
+    ).quantile(config.VCP_BBW_PERCENTILE)
+    squeeze = df["bbw"] <= bbw_threshold
+
+    vol_short = df["volume"].rolling(config.VCP_VOLUME_SHORT).mean()
+    vol_long = df["volume"].rolling(config.VCP_VOLUME_LONG).mean()
+    volumen_contraido = vol_short <= (vol_long * config.VCP_VOLUME_CONTRACTION_RATIO)
+
+    return (squeeze & volumen_contraido).fillna(False)
+
+
 # ---------------------------------------------------------------------------
 # Indicadores técnicos sobre el histórico de precios de UN ticker
 # ---------------------------------------------------------------------------
@@ -86,6 +122,12 @@ def add_technical_indicators(price_df: pd.DataFrame) -> pd.DataFrame:
     window_52w = min(len(df), 252)
     df["high_52w"] = df["close_adj"].rolling(window_52w, min_periods=20).max()
 
+    # Bandas de Bollinger + VCP (Patrón de Contracción de Volatilidad)
+    df["bb_ma20"], df["bb_upper"], df["bb_lower"], df["bbw"] = _bollinger_bandwidth(
+        df["close_adj"], length=config.VCP_BB_LENGTH, std_mult=config.VCP_BB_STD
+    )
+    df["vcp_signal"] = _detect_vcp(df)
+
     return df
 
 
@@ -102,6 +144,8 @@ def latest_snapshot(df_with_indicators: pd.DataFrame) -> dict:
         "cmf": _f(row.get("cmf")),
         "obv_mm20_slope": _f(row.get("obv_mm20_slope")),
         "high_52w": _f(row.get("high_52w")),
+        "bbw": _f(row.get("bbw")),
+        "vcp_signal": bool(row.get("vcp_signal")) if row.get("vcp_signal") is not None else False,
     }
 
 
@@ -221,9 +265,23 @@ def evaluate_conditions(valuation: dict, tech: dict, fund: dict, piotroski_score
     price_target = fund.get("price_target_avg")
     cond_consenso = precio is not None and price_target is not None and precio < price_target
 
+    # VCP (Patrón de Contracción de Volatilidad): señal explosiva de Motor 2,
+    # complementaria al pullback de MM50 (no lo sustituye en el cálculo del
+    # score porque ambas condiciones son independientes y suman por separado;
+    # ver nota en compute_score sobre cómo interpretarlas juntas en la UI).
+    cond_vcp = bool(tech.get("vcp_signal"))
+
+    # Insider Buying: la señal llega precalculada desde el proveedor de datos
+    # (ver data_providers.fmp_provider.get_insider_activity / scanner.py),
+    # que agrega el flujo neto de compras vs. ventas de directivos del último
+    # trimestre según config.INSIDER_BUY_SELL_RATIO_MIN.
+    cond_insider = bool(fund.get("insider_buying_signal"))
+
     return {
         "margen_seguridad": cond_margen,
         "piotroski": cond_piotroski,
+        "vcp_detectado": cond_vcp,
+        "insider_buying": cond_insider,
         "dilucion_controlada": cond_dilucion,
         "pullback_tendencia": cond_pullback,
         "rsi_bajo": cond_rsi,

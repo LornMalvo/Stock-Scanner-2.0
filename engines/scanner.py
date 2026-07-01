@@ -70,6 +70,15 @@ def _get_macro_cached(provider: DataProvider) -> dict:
     return fresh
 
 
+def _get_insider_activity_cached(provider: DataProvider, ticker: str) -> dict:
+    payload, stale = db.load_insider_activity(ticker)
+    if payload is not None and not stale:
+        return payload
+    fresh = provider.get_insider_activity(ticker)
+    db.save_insider_activity(ticker, fresh)
+    return fresh
+
+
 # ---------------------------------------------------------------------------
 # Análisis de un único ticker (profundo, para la vista "drill-down")
 # ---------------------------------------------------------------------------
@@ -95,6 +104,9 @@ def analyze_ticker(ticker: str, provider: DataProvider, meta: dict = None) -> di
     if not fund.get("price"):
         fund["price"] = tech_snapshot.get("precio_actual")
 
+    insider = _get_insider_activity_cached(provider, ticker)
+    fund["insider_buying_signal"] = bool(insider.get("signal"))
+
     valuation = fundamental.compute_valuation(
         fund, sector_bench, macro["us10y"], meta["is_financial"]
     )
@@ -110,6 +122,7 @@ def analyze_ticker(ticker: str, provider: DataProvider, meta: dict = None) -> di
         "fundamentals_raw": fund,
         "sector_benchmark": sector_bench,
         "macro": macro,
+        "insider_activity": insider,
         "price_history": price_df_ind,
         "technical_snapshot": tech_snapshot,
         "valuation": valuation,
@@ -146,6 +159,8 @@ def scan_universe(provider: DataProvider, tickers: list = None, progress_cb=None
                 "margen_seguridad_pct": v.get("margen_seguridad_pct"),
                 "piotroski": result["piotroski_score"],
                 "rsi14": result["technical_snapshot"].get("rsi14"),
+                "vcp_signal": result["technical_snapshot"].get("vcp_signal"),
+                "insider_signal": result["insider_activity"].get("signal"),
                 "hyper_growth": v.get("hyper_growth_mode"),
                 "rule_of_40": v.get("rule_of_40_ok"),
                 "score_pct": s.get("score_pct"),
