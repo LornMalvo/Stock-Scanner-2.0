@@ -183,6 +183,16 @@ def compute_valuation(fund: dict, sector_bench: dict, us10y: float, is_financial
 
     rule40_score, rule40_ok = compute_rule_of_40(fund.get("revenue_growth"), fund.get("ebitda_margin"))
 
+    # DataQualityFlag (Motor 1): nº de métodos de valoración que en teoría
+    # aplican a esta empresa (según su rama: EPS+/EPS- y financiera o no)
+    # frente a los que realmente se pudieron calcular con los datos
+    # disponibles del proveedor. Una empresa con "2 de 2 métodos" es tan
+    # fiable como pueda serlo el proveedor; una con "1 de 4" apoya su margen
+    # de seguridad en muy poca información y debería tratarse con cautela.
+    num_metodos_posibles = (1 if sin_eps_valido else 2) + 1 + 1 + (1 if is_financial else 0)
+    num_metodos_usados = len(valid_values)
+    valuation_quality_pct = (num_metodos_usados / num_metodos_posibles * 100) if num_metodos_posibles else 0.0
+
     return {
         "precio_actual": precio_actual,
         "fair_values": fair_values,
@@ -192,5 +202,7 @@ def compute_valuation(fund: dict, sector_bench: dict, us10y: float, is_financial
         "eps_negativo": bool(eps_negativo) if eps_forward is not None else None,
         "rule_of_40_score": rule40_score,
         "rule_of_40_ok": rule40_ok,
-        "num_metodos_usados": len(valid_values),
+        "num_metodos_usados": num_metodos_usados,
+        "num_metodos_posibles": num_metodos_posibles,
+        "valuation_quality_pct": valuation_quality_pct,
     }

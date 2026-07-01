@@ -10,10 +10,14 @@ Orquestador de todo el pipeline:
 Expone dos funciones principales para la UI:
   * analyze_ticker(ticker, provider): análisis profundo de un único valor.
   * scan_universe(provider, tickers=None, progress_cb=None): escaneo masivo
-    del S&P 500 (o subconjunto) devolviendo un DataFrame ordenado por score.
+    del S&P 500 (o subconjunto). Devuelve (DataFrame, scan_meta) — scan_meta
+    incluye avisos sobre el universo obtenido (ej. si se usó un fallback
+    degradado en vez del S&P 500 completo).
 """
 
 from datetime import datetime
+import time
+
 import pandas as pd
 
 import config
@@ -34,14 +38,17 @@ def _get_fundamentals_cached(provider: DataProvider, ticker: str) -> dict:
     return fresh
 
 
-def _get_prices_cached(provider: DataProvider, ticker: str, lookback_days=400) -> pd.DataFrame:
+def _get_prices_cached(provider: DataProvider, ticker: str, lookback_days=400,
+                        prefetched: pd.DataFrame = None) -> pd.DataFrame:
     if db.prices_are_fresh(ticker):
         df = db.load_prices(ticker, lookback_days)
         if not df.empty:
             return df
-    fresh = provider.get_price_history(ticker, lookback_days)
-    db.save_prices(ticker, fresh)
-    return fresh if not fresh.empty else db.load_prices(ticker, lookback_days)
+    fresh = prefetched if prefetched is not None else provider.get_price_history(ticker, lookback_days)
+    if fresh is not None and not fresh.empty:
+        db.save_prices(ticker, fresh)
+        return fresh
+    return db.load_prices(ticker, lookback_days)
 
 
 def _get_sector_benchmark_cached(provider: DataProvider, sector: str) -> dict:
@@ -79,10 +86,25 @@ def _get_insider_activity_cached(provider: DataProvider, ticker: str) -> dict:
     return fresh
 
 
+def _get_universe_cached(provider: DataProvider) -> tuple:
+    """Devuelve (universo: list, source: str). Cachea en SQLite con TTL
+    largo si la fuente fue fiable ('wikipedia'/'native') y TTL corto (1h)
+    si fue un fallback degradado, para reintentar pronto la fuente real."""
+    cached, source, stale = db.load_universe(provider.name)
+    if cached is not None and not stale:
+        return cached, f"cache:{source}"
+
+    fresh = provider.get_sp500_universe()
+    source = getattr(provider, "last_universe_source", "native")
+    db.save_universe(provider.name, fresh, source)
+    return fresh, source
+
+
 # ---------------------------------------------------------------------------
 # Análisis de un único ticker (profundo, para la vista "drill-down")
 # ---------------------------------------------------------------------------
-def analyze_ticker(ticker: str, provider: DataProvider, meta: dict = None) -> dict:
+def analyze_ticker(ticker: str, provider: DataProvider, meta: dict = None,
+                    prefetched_price_df: pd.DataFrame = None) -> dict:
     ticker = ticker.upper().strip()
 
     if meta is None:
@@ -94,7 +116,7 @@ def analyze_ticker(ticker: str, provider: DataProvider, meta: dict = None) -> di
         db.upsert_ticker_meta(ticker, meta["name"], meta["sector"], meta["industry"], meta["is_financial"])
 
     fund = _get_fundamentals_cached(provider, ticker)
-    price_df = _get_prices_cached(provider, ticker)
+    price_df = _get_prices_cached(provider, ticker, prefetched=prefetched_price_df)
     sector_bench = _get_sector_benchmark_cached(provider, meta["sector"])
     macro = _get_macro_cached(provider)
 
@@ -110,11 +132,12 @@ def analyze_ticker(ticker: str, provider: DataProvider, meta: dict = None) -> di
     valuation = fundamental.compute_valuation(
         fund, sector_bench, macro["us10y"], meta["is_financial"]
     )
-    piotroski = technical.piotroski_fscore_single(fund)
+    piotroski = technical.piotroski_fscore_single(fund)  # {'score':, 'completeness':}
     conditions = technical.evaluate_conditions(
-        valuation, tech_snapshot, fund, piotroski, sector_bench, macro["regime"]
+        valuation, tech_snapshot, fund, piotroski["score"], sector_bench, macro["regime"]
     )
     score = technical.compute_score(conditions)
+    data_quality = technical.compute_data_quality(valuation, piotroski["completeness"])
 
     return {
         "ticker": ticker,
@@ -126,30 +149,53 @@ def analyze_ticker(ticker: str, provider: DataProvider, meta: dict = None) -> di
         "price_history": price_df_ind,
         "technical_snapshot": tech_snapshot,
         "valuation": valuation,
-        "piotroski_score": piotroski,
+        "piotroski_score": piotroski["score"],
+        "piotroski_completeness": piotroski["completeness"],
         "conditions": conditions,
         "score": score,
+        "data_quality": data_quality,
     }
 
 
 # ---------------------------------------------------------------------------
 # Escaneo masivo del universo (S&P 500 o subconjunto)
 # ---------------------------------------------------------------------------
-def scan_universe(provider: DataProvider, tickers: list = None, progress_cb=None) -> pd.DataFrame:
-    universe = provider.get_sp500_universe()
+def scan_universe(provider: DataProvider, tickers: list = None, progress_cb=None):
+    """Devuelve (df: pd.DataFrame, scan_meta: dict).
+
+    scan_meta = {
+        'universe_size': int,
+        'universe_source': str,       # 'wikipedia' | 'fallback' | 'cache:...' | 'native' | ...
+        'warning': str | None,        # mensaje listo para mostrar en la UI si el universo está degradado
+    }
+    """
+    universe, universe_source = _get_universe_cached(provider)
     if tickers:
         wanted = set(t.upper() for t in tickers)
         universe = [u for u in universe if u["ticker"].upper() in wanted]
 
     macro = _get_macro_cached(provider)  # una sola vez para todo el escaneo
+
+    # Prefetch de precios por lotes si el proveedor lo soporta (reduce
+    # drásticamente el nº de peticiones HTTP frente a pedirlos uno a uno).
+    ticker_list = [m["ticker"] for m in universe]
+    bulk_prices = {}
+    if hasattr(provider, "get_price_history_bulk"):
+        try:
+            bulk_prices = provider.get_price_history_bulk(ticker_list) or {}
+        except Exception:
+            bulk_prices = {}
+
+    delay = getattr(provider, "request_delay_seconds", 0)
     rows = []
 
     for i, meta in enumerate(universe):
         ticker = meta["ticker"]
         try:
-            result = analyze_ticker(ticker, provider, meta)
+            result = analyze_ticker(ticker, provider, meta, prefetched_price_df=bulk_prices.get(ticker))
             v = result["valuation"]
             s = result["score"]
+            dq = result["data_quality"]
             rows.append({
                 "ticker": ticker,
                 "nombre": meta["name"],
@@ -166,6 +212,8 @@ def scan_universe(provider: DataProvider, tickers: list = None, progress_cb=None
                 "score_pct": s.get("score_pct"),
                 "score_total": s.get("score_total"),
                 "senal_entrada": s.get("senal_entrada"),
+                "calidad_datos": f"{dq['emoji']} {dq['overall_pct']:.0f}%",
+                "calidad_datos_pct": dq["overall_pct"],
             })
         except Exception as exc:  # nunca tumbar el escaneo completo por un ticker
             rows.append({
@@ -174,8 +222,25 @@ def scan_universe(provider: DataProvider, tickers: list = None, progress_cb=None
             })
         if progress_cb:
             progress_cb(i + 1, len(universe), ticker)
+        if delay:
+            time.sleep(delay)
 
     df = pd.DataFrame(rows)
     if "score_pct" in df.columns:
         df = df.sort_values("score_pct", ascending=False, na_position="last").reset_index(drop=True)
-    return df
+
+    warning = None
+    if universe_source in ("fallback", "cache:fallback"):
+        warning = (
+            f"⚠️ No se pudo obtener la lista completa del S&P 500 (falló el scraping de "
+            f"Wikipedia); se está usando un universo reducido de {len(universe)} valores "
+            f"diversificados, NO el S&P 500 completo. Vuelve a intentar el escaneo en un "
+            f"rato, o cambia de proveedor."
+        )
+
+    scan_meta = {
+        "universe_size": len(universe),
+        "universe_source": universe_source,
+        "warning": warning,
+    }
+    return df, scan_meta

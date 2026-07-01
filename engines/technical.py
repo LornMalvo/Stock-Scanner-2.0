@@ -158,14 +158,40 @@ def _f(v):
 # ---------------------------------------------------------------------------
 # Piotroski F-Score — 9 señales contables puras, vectorizado
 # ---------------------------------------------------------------------------
+# Columnas de entrada requeridas por cada una de las 9 señales. Se usan para
+# medir "completitud de datos" (DataQualityFlag): una señal que da False
+# porque el dato falta no es lo mismo que una señal que da False porque la
+# empresa realmente no la cumple, y de cara al usuario conviene distinguirlo.
+_PIOTROSKI_DEPS = {
+    "p1_roa_positivo": ["net_income", "total_assets"],
+    "p2_cfo_positivo": ["cfo"],
+    "p3_roa_creciente": ["net_income", "total_assets", "net_income_prior", "total_assets_prior"],
+    "p4_calidad_beneficio": ["cfo", "net_income"],
+    "p5_apalancamiento_baja": ["long_term_debt", "total_assets", "long_term_debt_prior", "total_assets_prior"],
+    "p6_liquidez_sube": ["current_assets", "current_liabilities", "current_assets_prior", "current_liabilities_prior"],
+    "p7_sin_dilucion": ["shares_outstanding", "shares_outstanding_prior_year"],
+    "p8_margen_bruto_sube": ["gross_profit", "revenue", "gross_profit_prior", "revenue_prior"],
+    "p9_rotacion_activos_sube": ["revenue", "total_assets", "revenue_prior", "total_assets_prior"],
+}
+
+
 def piotroski_fscore_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     """
     df: una fila por ticker con las columnas fundamentales necesarias (actual
     y del ejercicio previo). Devuelve el mismo df con una columna 'piotroski'
-    (0-9) y las 9 subseñales booleanas, todo calculado con operaciones
-    vectorizadas de pandas/numpy (sin bucles fila a fila).
+    (0-9), las 9 subseñales booleanas y 'piotroski_completeness' (0-9: en
+    cuántas de las 9 señales estaban disponibles TODOS los datos de entrada
+    necesarios), todo calculado con operaciones vectorizadas de
+    pandas/numpy (sin bucles fila a fila).
     """
     out = df.copy()
+
+    # Asegurar que existen todas las columnas requeridas (proveedores
+    # incompletos pueden no devolver alguna clave)
+    required_cols = sorted({c for deps in _PIOTROSKI_DEPS.values() for c in deps})
+    for col in required_cols:
+        if col not in out.columns:
+            out[col] = np.nan
 
     roa = out["net_income"] / out["total_assets"]
     roa_prior = out["net_income_prior"] / out["total_assets_prior"]
@@ -188,30 +214,41 @@ def piotroski_fscore_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     p8_margen_bruto_sube = (gross_margin > gross_margin_prior)
     p9_rotacion_activos_sube = (asset_turnover > asset_turnover_prior)
 
+    signal_cols = list(_PIOTROSKI_DEPS.keys())
     signals = pd.concat([
         p1_roa_positivo, p2_cfo_positivo, p3_roa_creciente, p4_calidad_beneficio,
         p5_apalancamiento_baja, p6_liquidez_sube, p7_sin_dilucion,
         p8_margen_bruto_sube, p9_rotacion_activos_sube
     ], axis=1)
-    signals.columns = [
-        "p1_roa_positivo", "p2_cfo_positivo", "p3_roa_creciente", "p4_calidad_beneficio",
-        "p5_apalancamiento_baja", "p6_liquidez_sube", "p7_sin_dilucion",
-        "p8_margen_bruto_sube", "p9_rotacion_activos_sube",
-    ]
+    signals.columns = signal_cols
     # NaN (datos insuficientes) cuenta como señal no cumplida, nunca como True
     signals = signals.fillna(False).astype(bool)
+
+    # Completitud: para cada una de las 9 señales, ¿estaban TODOS sus inputs
+    # presentes (no NaN)? Se suma cuántas de las 9 pudieron evaluarse con
+    # datos reales, independientemente de si el resultado fue True o False.
+    completeness_per_signal = pd.concat(
+        [out[deps].notna().all(axis=1).rename(name) for name, deps in _PIOTROSKI_DEPS.items()],
+        axis=1
+    )
+    out["piotroski_completeness"] = completeness_per_signal.sum(axis=1)
 
     out = pd.concat([out, signals], axis=1)
     out["piotroski"] = signals.sum(axis=1)
     return out
 
 
-def piotroski_fscore_single(fund: dict) -> int:
+def piotroski_fscore_single(fund: dict) -> dict:
     """Wrapper cómodo para calcular Piotroski de UN ticker reutilizando la
-    versión vectorizada (DataFrame de una fila)."""
+    versión vectorizada (DataFrame de una fila). Devuelve
+    {'score': 0-9, 'completeness': 0-9} en vez de solo el score, para poder
+    mostrar el DataQualityFlag en la UI."""
     df = pd.DataFrame([fund])
     result = piotroski_fscore_vectorized(df)
-    return int(result["piotroski"].iloc[0])
+    return {
+        "score": int(result["piotroski"].iloc[0]),
+        "completeness": int(result["piotroski_completeness"].iloc[0]),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -312,4 +349,40 @@ def compute_score(conditions: dict) -> dict:
         "score_pct": pct * 100,
         "senal_entrada": signal,
         "detalle": detail,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DataQualityFlag — indicador compuesto de cuánta información real hay
+# detrás del análisis de un ticker (no confundir con el score de timing)
+# ---------------------------------------------------------------------------
+def compute_data_quality(valuation: dict, piotroski_completeness: int) -> dict:
+    """
+    Combina dos señales de completitud de datos en un único indicador:
+      - valuation_quality_pct: % de métodos de valoración del Motor 1 que
+        se pudieron calcular (de los que en teoría aplican a esa empresa).
+      - piotroski_pct: % de las 9 señales de Piotroski para las que había
+        todos los datos contables necesarios.
+
+    No mide si la empresa es "buena", mide cuánto puedes fiarte del número
+    que ves — un margen de seguridad del 40% apoyado en 1 de 4 métodos vale
+    mucho menos que uno apoyado en 4 de 4.
+    """
+    valuation_pct = valuation.get("valuation_quality_pct") or 0.0
+    piotroski_pct = (piotroski_completeness / 9 * 100) if piotroski_completeness is not None else 0.0
+    overall_pct = (valuation_pct + piotroski_pct) / 2
+
+    if overall_pct >= config.DATA_QUALITY_HIGH_PCT:
+        level, emoji = "alta", "🟢"
+    elif overall_pct >= config.DATA_QUALITY_MEDIUM_PCT:
+        level, emoji = "media", "🟡"
+    else:
+        level, emoji = "baja", "🔴"
+
+    return {
+        "valuation_quality_pct": valuation_pct,
+        "piotroski_quality_pct": piotroski_pct,
+        "overall_pct": overall_pct,
+        "level": level,
+        "emoji": emoji,
     }
