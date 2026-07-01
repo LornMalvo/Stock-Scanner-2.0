@@ -16,10 +16,19 @@ data_providers/
   polygon_provider.py    -> Polygon.io (precios ajustados de alta fiabilidad)
 engines/
   fundamental.py         -> Motor 1: PER ajustado, PEG, EV/EBITDA, FCF Yield, P/B, hyper-growth, Regla del 40
-  technical.py            -> Motor 2: indicadores técnicos, Piotroski vectorizado, scoring ponderado
+  technical.py            -> Motor 2: indicadores técnicos (RSI/CMF/OBV en pandas/numpy puro), Piotroski vectorizado, scoring ponderado
   scanner.py              -> orquestador: caché -> Motor 1 -> Motor 2 -> resultado consolidado
 app.py                   -> UI Streamlit (escaneo de mercado + análisis individual)
 ```
+
+**Nota sobre dependencias**: los indicadores técnicos (RSI, Chaikin Money
+Flow, OBV) se calculan con pandas/numpy puro en `engines/technical.py`, sin
+depender de la librería `pandas-ta`. Ese paquete está sin mantenimiento desde
+2021, falla al instalarse en entornos de build aislados modernos (p. ej.
+Streamlit Community Cloud con Python 3.12+) y usa internamente `numpy.NaN`,
+un atributo eliminado en numpy≥1.24. Si en el futuro quieres indicadores más
+avanzados, considera `ta` (bukosabino/ta) o `TA-Lib` como alternativas mejor
+mantenidas — ambas requieren adaptar `add_technical_indicators()`.
 
 **Por qué esta separación**: cada proveedor de datos implementa la misma
 interfaz (`DataProvider`), así que cambiar de FMP a Polygon a IBKR es

@@ -14,9 +14,51 @@ Contiene:
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 
 import config
+
+
+# ---------------------------------------------------------------------------
+# NOTA DE ARQUITECTURA:
+# Los indicadores técnicos (RSI, CMF, OBV) se implementan aquí con
+# pandas/numpy puro en lugar de depender de la librería `pandas-ta`.
+# Motivo: el paquete `pandas-ta` publicado en PyPI (0.3.14b0) está sin
+# mantenimiento desde 2021, su instalación falla en entornos de build
+# aislados modernos (Streamlit Cloud, Python 3.12+) y además usa
+# internamente `numpy.NaN`, un atributo eliminado en numpy>=1.24. Calcular
+# estos tres indicadores estándar directamente elimina esa dependencia
+# frágil sin perder precisión ni funcionalidad.
+# ---------------------------------------------------------------------------
+def _rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    """RSI de Wilder (suavizado exponencial equivalente a la media móvil
+    de Wilder), el estándar de facto usado por la mayoría de plataformas."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    # Cuando avg_loss es 0 y avg_gain > 0, el RSI es 100 por definición
+    rsi = rsi.where(~((avg_loss == 0) & (avg_gain > 0)), 100.0)
+    return rsi
+
+
+def _cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, length: int = 20) -> pd.Series:
+    """Chaikin Money Flow estándar: suma(Money Flow Volume) / suma(Volumen) en la ventana."""
+    hl_range = (high - low).replace(0, np.nan)
+    mf_multiplier = ((close - low) - (high - close)) / hl_range
+    mf_volume = mf_multiplier * volume
+    cmf = mf_volume.rolling(length).sum() / volume.rolling(length).sum().replace(0, np.nan)
+    return cmf
+
+
+def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume: acumula +volumen si el cierre sube, -volumen si baja."""
+    direction = np.sign(close.diff().fillna(0))
+    return (direction * volume).cumsum()
 
 
 # ---------------------------------------------------------------------------
@@ -30,13 +72,13 @@ def add_technical_indicators(price_df: pd.DataFrame) -> pd.DataFrame:
 
     df["mm50"] = df["close_adj"].rolling(50).mean()
     df["mm200"] = df["close_adj"].rolling(200).mean()
-    df["rsi14"] = ta.rsi(df["close_adj"], length=14)
+    df["rsi14"] = _rsi(df["close_adj"], length=14)
 
     # Chaikin Money Flow (20 periodos, estándar)
-    df["cmf"] = ta.cmf(df["high"], df["low"], df["close_adj"], df["volume"], length=20)
+    df["cmf"] = _cmf(df["high"], df["low"], df["close_adj"], df["volume"], length=20)
 
     # On-Balance Volume + pendiente de su media móvil de 20 sesiones
-    df["obv"] = ta.obv(df["close_adj"], df["volume"])
+    df["obv"] = _obv(df["close_adj"], df["volume"])
     df["obv_mm20"] = df["obv"].rolling(20).mean()
     df["obv_mm20_slope"] = df["obv_mm20"].diff()
 
