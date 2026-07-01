@@ -195,3 +195,29 @@ class DemoProvider(DataProvider):
         # pueda alternar manualmente el régimen desde la UI si quiere testear
         # la excepción macro del margen de seguridad.
         return {"price": 5450.0, "mm200": 5200.0, "below_mm200": False}
+
+    def get_insider_activity(self, ticker: str) -> dict:
+        rng = self._seeded_rng(ticker + "_insider")
+        # ~40% de los tickers demo muestran acumulación neta de insiders
+        bullish = rng.random() < 0.4
+        if bullish:
+            buy_value = float(rng.uniform(80_000, 900_000))
+            sell_value = float(rng.uniform(0, buy_value * 0.3))
+        else:
+            buy_value = float(rng.uniform(0, 60_000))
+            sell_value = float(rng.uniform(50_000, 500_000))
+
+        buy_count = int(rng.integers(1, 6)) if buy_value > 0 else 0
+        sell_count = int(rng.integers(0, 4)) if sell_value > 0 else 0
+        net_value = buy_value - sell_value
+
+        import config as _cfg
+        signal = (
+            buy_value >= _cfg.INSIDER_MIN_BUY_VALUE_USD
+            and (sell_value == 0 or buy_value >= sell_value * _cfg.INSIDER_BUY_SELL_RATIO_MIN)
+        )
+        return {
+            "buy_value": buy_value, "sell_value": sell_value,
+            "buy_count": buy_count, "sell_count": sell_count,
+            "net_value": net_value, "signal": signal, "source": "demo",
+        }

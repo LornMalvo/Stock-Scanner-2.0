@@ -46,3 +46,27 @@ class DataProvider(ABC):
     def get_market_regime(self) -> dict:
         """Devuelve {'price': ..., 'mm200': ..., 'below_mm200': bool} para el S&P 500."""
         raise NotImplementedError
+
+    def get_insider_activity(self, ticker: str) -> dict:
+        """
+        Flujo neto de transacciones de directivos (insiders) en el último
+        trimestre (config.INSIDER_LOOKBACK_DAYS).
+
+        NO es abstracto: no todos los proveedores lo soportan (ej. Polygon
+        no expone esto de forma fiable en el plan estándar). La
+        implementación por defecto devuelve "sin señal", de modo que
+        engines/technical.evaluate_conditions() simplemente no puntúa esa
+        condición en vez de fallar.
+
+        Debe devolver:
+          {
+            "buy_value": float, "sell_value": float,
+            "buy_count": int, "sell_count": int,
+            "net_value": float, "signal": bool, "source": str,
+          }
+        """
+        return {
+            "buy_value": 0.0, "sell_value": 0.0,
+            "buy_count": 0, "sell_count": 0,
+            "net_value": 0.0, "signal": False, "source": "unsupported",
+        }

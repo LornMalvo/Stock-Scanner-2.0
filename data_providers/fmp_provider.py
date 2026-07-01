@@ -172,3 +172,67 @@ class FMPProvider(DataProvider):
         mm200 = df["close_adj"].rolling(200).mean().iloc[-1]
         price = df["close_adj"].iloc[-1]
         return {"price": float(price), "mm200": float(mm200), "below_mm200": bool(price < mm200)}
+
+    # -- insider trading ---------------------------------------------------------
+    def get_insider_activity(self, ticker: str) -> dict:
+        """
+        Endpoint FMP de transacciones de insiders (Form 4 de la SEC).
+        Agrega el flujo neto de compras vs. ventas en los últimos
+        config.INSIDER_LOOKBACK_DAYS días para producir una señal booleana.
+
+        NOTA: el nombre/version exacto del endpoint (`/v4/insider-trading`)
+        puede variar según el plan de FMP contratado; si tu plan expone un
+        endpoint distinto, este es el único método a adaptar.
+        """
+        from datetime import datetime, timedelta
+        import config as _cfg
+
+        cutoff = datetime.utcnow() - timedelta(days=_cfg.INSIDER_LOOKBACK_DAYS)
+
+        try:
+            data = self._get(
+                "insider-trading", base="https://financialmodelingprep.com/api/v4",
+                symbol=ticker, page=0, limit=1000
+            )
+        except requests.RequestException:
+            data = []
+
+        buy_value, sell_value, buy_count, sell_count = 0.0, 0.0, 0, 0
+
+        for tx in data:
+            tx_date_str = tx.get("transactionDate") or tx.get("filingDate")
+            if not tx_date_str:
+                continue
+            try:
+                tx_date = datetime.fromisoformat(tx_date_str[:10])
+            except ValueError:
+                continue
+            if tx_date < cutoff:
+                continue
+
+            acq_disp = (tx.get("acquisitionOrDisposition") or "").upper()
+            shares = float(tx.get("securitiesTransacted") or 0)
+            price = float(tx.get("price") or 0)
+            value = shares * price
+
+            if acq_disp == "A":
+                buy_value += value
+                buy_count += 1
+            elif acq_disp == "D":
+                sell_value += value
+                sell_count += 1
+
+        net_value = buy_value - sell_value
+        signal = (
+            buy_value >= _cfg.INSIDER_MIN_BUY_VALUE_USD
+            and (
+                sell_value == 0
+                or buy_value >= sell_value * _cfg.INSIDER_BUY_SELL_RATIO_MIN
+            )
+        )
+
+        return {
+            "buy_value": buy_value, "sell_value": sell_value,
+            "buy_count": buy_count, "sell_count": sell_count,
+            "net_value": net_value, "signal": signal, "source": "fmp",
+        }
