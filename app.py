@@ -176,13 +176,15 @@ if mode.startswith("📊"):
         "con timing técnico favorable."
     )
 
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         run_scan = st.button("🚀 Ejecutar escaneo", type="primary")
     with col_b:
         min_score_filter = st.slider("Score mínimo (%)", 0, 100, 0, step=5)
     with col_c:
         solo_senales = st.checkbox("Solo mostrar SEÑAL DE ENTRADA", value=False)
+    with col_d:
+        min_quality_filter = st.slider("Calidad de datos mínima (%)", 0, 100, 0, step=10)
 
     if run_scan:
         progress = st.progress(0.0, text="Iniciando escaneo...")
@@ -191,26 +193,44 @@ if mode.startswith("📊"):
             progress.progress(done / total, text=f"Analizando {ticker} ({done}/{total})")
 
         with st.spinner("Descargando/actualizando datos y calculando..."):
-            df_scan = scanner.scan_universe(provider, progress_cb=_cb)
+            df_scan, scan_meta = scanner.scan_universe(provider, progress_cb=_cb)
         progress.empty()
         st.session_state["df_scan"] = df_scan
+        st.session_state["scan_meta"] = scan_meta
 
     df_scan = st.session_state.get("df_scan")
+    scan_meta = st.session_state.get("scan_meta")
+
+    if scan_meta and scan_meta.get("warning"):
+        st.warning(scan_meta["warning"])
+    elif scan_meta:
+        st.caption(
+            f"Universo analizado: {scan_meta['universe_size']} tickers "
+            f"(fuente: `{scan_meta['universe_source']}`)."
+        )
+
     if df_scan is not None and not df_scan.empty:
         view = df_scan.copy()
         if "score_pct" in view.columns:
             view = view[view["score_pct"].fillna(0) >= min_score_filter]
         if solo_senales and "senal_entrada" in view.columns:
             view = view[view["senal_entrada"] == True]  # noqa: E712
+        if "calidad_datos_pct" in view.columns:
+            view = view[view["calidad_datos_pct"].fillna(0) >= min_quality_filter]
 
+        display_cols = [c for c in view.columns if c != "calidad_datos_pct"]
         st.dataframe(
-            view.style.format({
+            view[display_cols].style.format({
                 "precio": "{:.2f}", "valor_justo": "{:.2f}",
                 "margen_seguridad_pct": "{:.1f}%", "score_pct": "{:.1f}%",
             }, na_rep="—"),
             use_container_width=True, hide_index=True
         )
-        st.caption(f"{len(view)} de {len(df_scan)} tickers tras filtros.")
+        st.caption(
+            f"{len(view)} de {len(df_scan)} tickers tras filtros. "
+            "Columna 'calidad_datos': 🟢 alta / 🟡 media / 🔴 baja fiabilidad "
+            "de los datos fundamentales usados (ver explicación en el análisis individual)."
+        )
     else:
         st.info("Pulsa **Ejecutar escaneo** para analizar el universo (proveedor: "
                 f"`{provider_name}`).")
@@ -238,15 +258,32 @@ else:
         meta = result["meta"]
         v = result["valuation"]
         s = result["score"]
+        dq = result["data_quality"]
 
         st.subheader(f"{meta['name']} ({result['ticker']}) — {meta['sector']}")
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Precio actual", f"${v.get('precio_actual', 0):.2f}" if v.get("precio_actual") else "N/D")
         c2.metric("Valor justo promedio", f"${v.get('fair_value_promedio', 0):.2f}" if v.get("fair_value_promedio") else "N/D")
         margen = v.get("margen_seguridad_pct")
         c3.metric("Margen de Seguridad", f"{margen:.1f}%" if margen is not None else "N/D")
         c4.metric("Piotroski F-Score", f"{result['piotroski_score']}/9")
+        c5.metric(
+            "Calidad de datos", f"{dq['emoji']} {dq['overall_pct']:.0f}%",
+            help=(
+                f"Motor 1: {v.get('num_metodos_usados', 0)}/{v.get('num_metodos_posibles', 0)} "
+                f"métodos de valoración calculados. Piotroski: {result['piotroski_completeness']}/9 "
+                "señales con todos los datos contables disponibles. Un porcentaje bajo no significa "
+                "que la empresa sea mala — significa que este análisis se apoya en pocos datos y "
+                "conviene verificarlo manualmente antes de confiar en él."
+            )
+        )
+        if dq["level"] == "baja":
+            st.caption(
+                "🔴 Calidad de datos baja: el margen de seguridad y/o el Piotroski de este ticker "
+                "se apoyan en poca información del proveedor. Trátalo como orientativo y contrástalo "
+                "con otra fuente antes de decidir nada."
+            )
 
         badges = []
         if v.get("hyper_growth_mode"):

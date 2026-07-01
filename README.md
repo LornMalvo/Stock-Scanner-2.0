@@ -50,6 +50,54 @@ Sin ninguna API key, la app funciona igualmente con el **proveedor `demo`**
 (datos sintéticos deterministas), lo que permite validar toda la lógica de
 los dos motores y la UI de principio a fin.
 
+## Robustez del proveedor yfinance (rate-limiting y universo degradado)
+
+Yahoo Finance aplica rate-limiting agresivo a `yfinance`, especialmente en
+IPs compartidas como las de Streamlit Community Cloud. Además, el listado
+del S&P 500 se obtiene por scraping de Wikipedia, que puede fallar por red,
+bloqueo o cambio de estructura de la página. Mitigaciones implementadas:
+
+- **Caché del universo de tickers** (`database.universe_cache`, TTL 30 días
+  si el scraping tuvo éxito, 1 hora si se usó fallback) — evita repetir el
+  scraping en cada escaneo y reintenta pronto tras un fallo puntual.
+- **Scraping con cabecera de navegador** (Wikipedia rechaza peticiones sin
+  `User-Agent`) y validación de que la tabla tiene ~500 filas antes de
+  darla por buena.
+- **Fallback ampliado y transparente**: si el scraping falla igualmente, se
+  usa un conjunto diversificado de ~50 blue chips (todas las categorías
+  GICS) en vez de un puñado de tickers, y la UI muestra un aviso explícito
+  (`scan_meta['warning']`) indicando que NO es el S&P 500 completo.
+- **Descarga de precios por lotes** (`get_price_history_bulk`, vía
+  `yf.download` con `group_by='ticker'`) en vez de una petición por ticker,
+  para reducir drásticamente el número de peticiones HTTP en un escaneo
+  masivo.
+- **Reintentos con backoff exponencial** (`YF_MAX_RETRIES`,
+  `YF_BACKOFF_BASE_SECONDS`) en las llamadas más sensibles a 429 (`.info`,
+  histórico de acciones en circulación, insider trading).
+- **Pausa entre tickers** (`YF_REQUEST_DELAY_SECONDS`) durante un escaneo
+  masivo, solo aplicada a proveedores que la declaren (`yfinance`; `fmp` y
+  `polygon` no la necesitan).
+
+## DataQualityFlag — cuánto fiarte de cada análisis
+
+Cada ticker analizado incluye un indicador compuesto (🟢 alta / 🟡 media /
+🔴 baja) que **no mide si la empresa es buena**, mide cuánta información
+real había detrás del número que ves:
+
+- **Motor 1**: nº de métodos de valoración calculados / nº de métodos que en
+  teoría aplican a esa empresa (`valuation.num_metodos_usados` /
+  `num_metodos_posibles`).
+- **Piotroski**: de las 9 señales, cuántas tenían TODOS sus datos contables
+  de entrada disponibles (`piotroski_completeness`), no solo si el
+  resultado fue True/False — una señal que da False porque falta el dato NO
+  se distingue automáticamente de una que da False porque la empresa
+  realmente no la cumple, salvo por este indicador.
+
+Se muestra como columna en el escaneo masivo (`calidad_datos`, filtrable
+con un slider) y como métrica + aviso en el análisis individual. Los
+umbrales (`DATA_QUALITY_HIGH_PCT`, `DATA_QUALITY_MEDIUM_PCT`) están en
+`config.py`.
+
 ## Proveedores de datos disponibles
 
 | Proveedor | API key | Fiabilidad fundamentales | Notas |

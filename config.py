@@ -117,3 +117,26 @@ INSIDER_BUY_SELL_RATIO_MIN = 2.0
 # la señal (ruido). Umbral en USD.
 INSIDER_MIN_BUY_VALUE_USD = 50_000
 
+# ---------------------------------------------------------------------------
+# Caché del universo de tickers (S&P 500)
+# ---------------------------------------------------------------------------
+# TTL largo cuando la obtención tuvo éxito (la composición del S&P 500 apenas
+# cambia). TTL corto cuando se usó un fallback degradado, para reintentar
+# pronto la fuente real en el siguiente escaneo.
+UNIVERSE_CACHE_TTL_DAYS = 30
+UNIVERSE_FALLBACK_RETRY_HOURS = 1
+
+# ---------------------------------------------------------------------------
+# Mitigación de rate-limiting en yfinance (Yahoo bloquea IPs con ráfagas de
+# peticiones, algo frecuente en IPs compartidas como Streamlit Cloud)
+# ---------------------------------------------------------------------------
+YF_REQUEST_DELAY_SECONDS = 0.35   # pausa entre tickers durante un escaneo masivo
+YF_MAX_RETRIES = 3
+YF_BACKOFF_BASE_SECONDS = 1.5     # backoff exponencial: 1.5s, 3s, 6s...
+
+# ---------------------------------------------------------------------------
+# Indicador de calidad de datos por ticker (DataQualityFlag)
+# ---------------------------------------------------------------------------
+DATA_QUALITY_HIGH_PCT = 80    # >=80% de inputs disponibles -> 🟢
+DATA_QUALITY_MEDIUM_PCT = 50  # 50-79% -> 🟡 ; <50% -> 🔴
+

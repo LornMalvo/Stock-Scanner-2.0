@@ -86,6 +86,14 @@ def init_db():
             payload TEXT,       -- JSON: buy_value, sell_value, buy_count, sell_count, net_value, signal
             updated_at TEXT
         )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS universe_cache (
+            provider TEXT PRIMARY KEY,
+            payload TEXT,       -- JSON: lista de tickers del universo
+            source TEXT,        -- 'wikipedia' | 'fallback' | 'native' ...
+            expires_at TEXT
+        )""")
         c.execute("""
         CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date)
         """)
@@ -277,3 +285,35 @@ def load_insider_activity(ticker):
     payload = json.loads(row[0])
     stale = _is_stale(row[1], timedelta(days=config.INSIDER_CACHE_TTL_DAYS))
     return payload, stale
+
+
+# ---------------------------------------------------------------------------
+# Universo de tickers (S&P 500 u otro) — cacheado por proveedor
+# ---------------------------------------------------------------------------
+def save_universe(provider_name: str, tickers: list, source: str):
+    ttl = (
+        timedelta(days=config.UNIVERSE_CACHE_TTL_DAYS)
+        if source == "wikipedia"
+        else timedelta(hours=config.UNIVERSE_FALLBACK_RETRY_HOURS)
+    )
+    expires_at = (datetime.utcnow() + ttl).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO universe_cache (provider, payload, source, expires_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(provider) DO UPDATE SET
+                payload=excluded.payload, source=excluded.source, expires_at=excluded.expires_at
+        """, (provider_name, json.dumps(tickers), source, expires_at))
+
+
+def load_universe(provider_name: str):
+    """Devuelve (tickers|None, source|None, stale: bool)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT payload, source, expires_at FROM universe_cache WHERE provider=?", (provider_name,)
+        ).fetchone()
+    if not row:
+        return None, None, True
+    tickers = json.loads(row[0])
+    stale = datetime.utcnow() > datetime.fromisoformat(row[2])
+    return tickers, row[1], stale
